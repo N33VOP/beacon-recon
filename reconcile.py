@@ -33,10 +33,15 @@ SEVERITY_ORDER = {
     "FX CHECK": 4,
     "DATE SLIP": 5,
     "NO PRICE SHOWN": 6,
-    "CURRENCY — REVIEW": 7,
+    "AWAITING CONFIRM": 7,
+    "CURRENCY — REVIEW": 8,
     "NEEDS REVIEW": 8,
     "OK": 9,
 }
+
+# A line unconfirmed on a PO younger than this is probably just pending, not dropped.
+# Placeholder until Lisa confirms the real order->acknowledgment window.
+AWAIT_DAYS = 14
 
 
 def load_reference(po_csv, vendor_csv):
@@ -109,6 +114,19 @@ def _match_lines(po_lines, conf_lines, vendor_uses_own_pn):
     return matched, used_conf
 
 
+def _drop_issue(po, detail_prefix):
+    """A dropped line on a young PO is probably just pending acknowledgment, not dropped."""
+    from datetime import date
+    pd, _ = _parse_date(po.get("po_date"))
+    if pd is not None:
+        age = (date.today() - pd).days
+        if age < AWAIT_DAYS:
+            return ("AWAITING CONFIRM",
+                    f"{detail_prefix} — PO only {age}d old, may still be pending (not yet dropped)")
+        return ("DROPPED LINE", f"{detail_prefix} — PO placed {age}d ago")
+    return ("DROPPED LINE", detail_prefix)
+
+
 def reconcile(pos, vendors, confirmations, usd_per_eur=None):
     """
     confirmations: list of dicts, each:
@@ -146,8 +164,8 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
         # Validation: did we even get a confirmation for this PO?
         if po_key not in confs_by_po:
             for _, po in po_lines.iterrows():
-                results.append(_row(po_number, po, None, "DROPPED LINE",
-                                    "On PO; no confirmation found for this PO"))
+                issue, detail = _drop_issue(po, "On PO; no confirmation found for this PO")
+                results.append(_row(po_number, po, None, issue, detail))
             continue
 
         # gather all confirmed lines for this PO
@@ -165,8 +183,8 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
 
         for po, conf in matched:
             if conf is None:
-                results.append(_row(po_number, po, None, "DROPPED LINE",
-                                    "On PO; not confirmed by vendor"))
+                issue, detail = _drop_issue(po, "On PO; not confirmed by vendor")
+                results.append(_row(po_number, po, None, issue, detail))
                 continue
 
             issues = []
