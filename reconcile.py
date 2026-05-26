@@ -32,7 +32,8 @@ SEVERITY_ORDER = {
     "PRICE DRIFT": 3,
     "CURRENCY — REVIEW": 4,
     "DATE SLIP": 5,
-    "NEEDS REVIEW": 6,
+    "NO PRICE SHOWN": 6,
+    "NEEDS REVIEW": 7,
     "OK": 9,
 }
 
@@ -132,6 +133,7 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
                 "po_says": "not on open PO list",
                 "vendor_says": "vendor sent a confirmation",
                 "detail": "Confirmation references a PO not on the open list — closed, duplicate, or wrong number",
+                "source_file": c.get("_file", ""),
             })
 
     for po_number, po_group in pos.groupby("po_number"):
@@ -153,6 +155,8 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
         for c in confs_by_po[po_key]:
             currency = c.get("currency", "USD")
             for ln in c["lines"]:
+                ln = dict(ln)
+                ln["_file"] = c.get("_file", "")
                 conf_rows.append(ln)
         conf_lines = pd.DataFrame(conf_rows)
 
@@ -189,7 +193,7 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
                                        f"(@ {usd_per_eur:.4f} USD/EUR) — outside {PRICE_DRIFT_PCT*100:.0f}%"))
                     # within band -> not an issue
                 except (TypeError, ValueError):
-                    issues.append(("NEEDS REVIEW", "no/unparseable EUR price"))
+                    issues.append(("NO PRICE SHOWN", "no price shown on confirmation (service/contract pricing?)"))
             elif cur != "USD":
                 issues.append(("CURRENCY — REVIEW",
                                f"confirmed in {currency}; no live rate available to convert"))
@@ -201,7 +205,7 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
                         issues.append(("PRICE DRIFT",
                                        f"PO ${po_price:.4f}, confirmed ${cp:.4f}"))
                 except (TypeError, ValueError):
-                    issues.append(("NEEDS REVIEW", "no/unparseable price on confirmation"))
+                    issues.append(("NO PRICE SHOWN", "no price shown on confirmation (service/contract pricing?)"))
 
             # --- DATE ---
             cd, ambiguous = _parse_date(conf.get("promise_date_raw"))
@@ -237,4 +241,5 @@ def _row(po_number, po, conf, issue, detail):
         "vendor_says": (f"qty {conf.get('quantity')} @ {conf.get('unit_price')} by {conf.get('promise_date_raw')}"
                         if conf is not None else "— nothing —"),
         "detail": detail,
+        "source_file": (conf.get("_file", "") if conf is not None else ""),
     }

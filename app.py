@@ -91,6 +91,7 @@ if uploaded and st.button("Reconcile", type="primary"):
     progress = st.progress(0.0, text="Reading confirmations...")
     for i, f in enumerate(pdfs):
         conf, status = extract_one(f)
+        conf["_file"] = f.name
         if status == "scan_review":
             scans.append(f.name)
         else:
@@ -127,7 +128,7 @@ if uploaded and st.button("Reconcile", type="primary"):
 
     # --- scanned / unreadable ---
     if scans:
-        st.subheader(f"Couldn't auto-read — {len(scans)} (scanned, need eyes)")
+        st.subheader(f"Couldn't read — {len(scans)} file(s) need a human")
         st.write(", ".join(scans))
 
     # --- Excel download ---
@@ -135,7 +136,7 @@ if uploaded and st.button("Reconcile", type="primary"):
     with pd.ExcelWriter(buf, engine="openpyxl") as xl:
         action.to_excel(xl, sheet_name="Action Needed", index=False)
         results.to_excel(xl, sheet_name="All Results", index=False)
-        pd.DataFrame({"scanned_file": scans}).to_excel(xl, sheet_name="Needs Review", index=False)
-    st.download_button("Download Excel for Lisa", buf.getvalue(),
+        pd.DataFrame({"scanned_file": scans}).to_excel(xl, sheet_name="Unreadable Files", index=False)
+    st.download_button("Download Excel", buf.getvalue(),
                        file_name="reconciliation.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
