@@ -24,15 +24,17 @@ def extract_one(f):
     return extract.extract_confirmation(data, name=f.name)
 
 
-# Severity -> colour for the on-screen table
+# Severity -> soft tint for the on-screen table (dark text forced for contrast)
 SEV_COLOR = {
-    "DROPPED LINE": "#fde0e0",
-    "QTY MISMATCH": "#ffe9d6",
-    "PRICE DRIFT": "#fff4cc",
-    "CURRENCY — REVIEW": "#e7e0ff",
-    "DATE SLIP": "#e0eeff",
-    "NEEDS REVIEW": "#eeeeee",
-    "OK": "#e3f5e1",
+    "DROPPED LINE": "#f8c9c9",
+    "QTY MISMATCH": "#fbd9b5",
+    "UNKNOWN PO": "#fbd9b5",
+    "PRICE DRIFT": "#fcec9e",
+    "CURRENCY — REVIEW": "#dcd2f5",
+    "DATE SLIP": "#c9def8",
+    "NO PRICE SHOWN": "#e6e6e6",
+    "NEEDS REVIEW": "#e6e6e6",
+    "OK": "#cde8c5",
 }
 
 st.title("Beacon PO Confirmation Reconciliation")
@@ -87,22 +89,30 @@ if uploaded and st.button("Reconcile", type="primary"):
     pos, vendors = load_reference(po_file, vendor_file)
 
     # --- extract every PDF ---
-    confirmations, scans = [], []
+    confirmations, scans, errors = [], [], []
     progress = st.progress(0.0, text="Reading confirmations...")
     for i, f in enumerate(pdfs):
-        conf, status = extract_one(f)
-        conf["_file"] = f.name
-        if status == "scan_review":
-            scans.append(f.name)
-        else:
-            confirmations.append(conf)
+        try:
+            conf, status = extract_one(f)
+            conf["_file"] = f.name
+            if status == "scan_review":
+                scans.append(f.name)
+            else:
+                confirmations.append(conf)
+        except Exception as e:
+            errors.append({"file": f.name, "error": str(e)[:300]})
         progress.progress((i + 1) / max(len(pdfs), 1), text=f"Read {f.name}")
     progress.empty()
 
-    from currency import usd_per_eur
-    fx_rate = usd_per_eur()
-    if fx_rate:
-        st.caption(f"Live FX applied: 1 EUR = ${fx_rate:.4f} USD (ECB). EUR prices converted and checked within 2%.")
+    if errors:
+        st.warning(f"{len(errors)} file(s) couldn't be processed (likely API rate limit). "
+                   "They're listed below and in the Excel — the rest still reconciled.")
+        st.dataframe(pd.DataFrame(errors), use_container_width=True)
+
+    from currency import usd_per_eur_detailed
+    fx_rate, fx_live = usd_per_eur_detailed()
+    src = "live ECB" if fx_live else "fallback (live FX unreachable)"
+    st.caption(f"FX applied: 1 EUR = ${fx_rate:.4f} USD ({src}). EUR prices converted and checked within 2%.")
 
     results = reconcile(pos, vendors, confirmations, usd_per_eur=fx_rate)
     action = results[results["issue"] != "OK"].reset_index(drop=True)
@@ -118,8 +128,8 @@ if uploaded and st.button("Reconcile", type="primary"):
     st.subheader(f"Action Needed — {len(action)} lines")
 
     def _highlight(row):
-        c = SEV_COLOR.get(row["issue"], "white")
-        return [f"background-color: {c}"] * len(row)
+        c = SEV_COLOR.get(row["issue"], "#ffffff")
+        return [f"background-color: {c}; color: #14181f"] * len(row)
 
     if len(action):
         st.dataframe(action.style.apply(_highlight, axis=1), use_container_width=True, height=480)
@@ -131,12 +141,10 @@ if uploaded and st.button("Reconcile", type="primary"):
         st.subheader(f"Couldn't read — {len(scans)} file(s) need a human")
         st.write(", ".join(scans))
 
-    # --- Excel download ---
+    # --- Excel download (shared, formatted writer) ---
+    from excel_out import write_workbook
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-        action.to_excel(xl, sheet_name="Action Needed", index=False)
-        results.to_excel(xl, sheet_name="All Results", index=False)
-        pd.DataFrame({"scanned_file": scans}).to_excel(xl, sheet_name="Unreadable Files", index=False)
-    st.download_button("Download Excel", buf.getvalue(),
+    write_workbook(buf, action, results, scans, errors)
+    st.download_button("Download Excel for Lisa", buf.getvalue(),
                        file_name="reconciliation.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
