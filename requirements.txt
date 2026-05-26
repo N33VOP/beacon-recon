@@ -2,4 +2,5 @@ streamlit
 groq
 pdfplumber
 pandas
+pymupdf
 openpyxl

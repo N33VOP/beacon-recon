@@ -10,8 +10,16 @@ The LLM NEVER decides whether a price drifted. Code does that. The LLM
 only reads messy PDFs into clean rows.
 """
 
+import re
 import pandas as pd
 from datetime import datetime
+
+
+def _norm_po(x):
+    """Canonicalise a PO number so 'PO PO-4500050030', ' po-4500050030 ' etc all match."""
+    s = str(x).upper()
+    m = re.search(r"(\d{6,})", s)
+    return "PO-" + m.group(1) if m else s.strip()
 
 # Percentage threshold for flagging a price drift (handles the wide price range)
 PRICE_DRIFT_PCT = 0.02  # 2%
@@ -20,10 +28,11 @@ PRICE_DRIFT_PCT = 0.02  # 2%
 SEVERITY_ORDER = {
     "DROPPED LINE": 0,
     "QTY MISMATCH": 1,
-    "PRICE DRIFT": 2,
-    "CURRENCY — REVIEW": 3,
-    "DATE SLIP": 4,
-    "NEEDS REVIEW": 5,
+    "UNKNOWN PO": 2,
+    "PRICE DRIFT": 3,
+    "CURRENCY — REVIEW": 4,
+    "DATE SLIP": 5,
+    "NEEDS REVIEW": 6,
     "OK": 9,
 }
 
@@ -43,9 +52,17 @@ def _parse_date(raw):
     if raw is None or str(raw).strip() == "":
         return None, True
     raw = str(raw).strip()
-    # ambiguous formats we will NOT guess on (e.g. German calendar weeks "KW 20-22")
-    if "kw" in raw.lower() or "-" in raw and any(c.isalpha() for c in raw):
-        return None, True
+
+    # German calendar weeks, e.g. "KW 20-22 / 2026" -> take end of latest week (conservative)
+    kw = re.search(r"KW\s*(\d{1,2})\s*[-–]?\s*(\d{1,2})?\s*/?\s*(\d{4})", raw, re.I)
+    if kw:
+        wk = int(kw.group(2) or kw.group(1))  # latest week in the range
+        yr = int(kw.group(3))
+        try:
+            return datetime.fromisocalendar(yr, wk, 7).date(), False  # Sunday of that week
+        except ValueError:
+            return None, True
+
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d.%m.%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(raw, fmt).date(), False
@@ -90,35 +107,50 @@ def _match_lines(po_lines, conf_lines, vendor_uses_own_pn):
     return matched, used_conf
 
 
-def reconcile(pos, vendors, confirmations):
+def reconcile(pos, vendors, confirmations, usd_per_eur=None):
     """
     confirmations: list of dicts, each:
       {po_number, currency, lines: [{part_number_shown, quantity, unit_price,
                                       promise_date_raw}], _confidence, _note}
+    usd_per_eur: live FX rate (USD per 1 EUR). If given, EUR prices are converted
+                 and checked against the tolerance band instead of just flagged.
     Returns a results DataFrame.
     """
     results = []
     vendor_lookup = vendors.set_index("vendor_name")["own_pn"].to_dict()
     confs_by_po = {}
     for c in confirmations:
-        confs_by_po.setdefault(c["po_number"], []).append(c)
+        confs_by_po.setdefault(_norm_po(c["po_number"]), []).append(c)
+
+    # Edge case: a confirmation for a PO that isn't on the open list (closed/duplicate/typo)
+    po_keys = {_norm_po(p) for p in pos["po_number"].unique()}
+    for c in confirmations:
+        if _norm_po(c["po_number"]) not in po_keys:
+            results.append({
+                "po_number": c["po_number"], "vendor": "(unknown)", "line": "-",
+                "our_pn": "-", "issue": "UNKNOWN PO",
+                "po_says": "not on open PO list",
+                "vendor_says": "vendor sent a confirmation",
+                "detail": "Confirmation references a PO not on the open list — closed, duplicate, or wrong number",
+            })
 
     for po_number, po_group in pos.groupby("po_number"):
         po_lines = po_group.reset_index(drop=True)
         vendor_name = po_lines.iloc[0]["vendor_name"]
         uses_own = vendor_lookup.get(vendor_name, False)
+        po_key = _norm_po(po_number)
 
         # Validation: did we even get a confirmation for this PO?
-        if po_number not in confs_by_po:
+        if po_key not in confs_by_po:
             for _, po in po_lines.iterrows():
                 results.append(_row(po_number, po, None, "DROPPED LINE",
-                                    "No confirmation received for this PO at all"))
+                                    "On PO; no confirmation found for this PO"))
             continue
 
         # gather all confirmed lines for this PO
         conf_rows = []
         currency = "USD"
-        for c in confs_by_po[po_number]:
+        for c in confs_by_po[po_key]:
             currency = c.get("currency", "USD")
             for ln in c["lines"]:
                 conf_rows.append(ln)
@@ -143,10 +175,24 @@ def reconcile(pos, vendors, confirmations):
             except (TypeError, ValueError):
                 issues.append(("NEEDS REVIEW", "could not parse confirmed quantity"))
 
-            # --- PRICE (only if same currency!) ---
-            if currency.upper() != "USD":
+            # --- PRICE ---
+            cur = currency.upper()
+            if cur == "EUR" and usd_per_eur:
+                # convert at live rate, then apply the same tolerance band
+                try:
+                    cp_eur = float(str(conf.get("unit_price")).replace("€", "").replace(",", ""))
+                    cp_usd = cp_eur * usd_per_eur
+                    po_price = float(po["unit_price"])
+                    if po_price > 0 and abs(cp_usd - po_price) / po_price > PRICE_DRIFT_PCT:
+                        issues.append(("PRICE DRIFT",
+                                       f"PO ${po_price:.4f} vs €{cp_eur:.4f} ≈ ${cp_usd:.2f} "
+                                       f"(@ {usd_per_eur:.4f} USD/EUR) — outside {PRICE_DRIFT_PCT*100:.0f}%"))
+                    # within band -> not an issue
+                except (TypeError, ValueError):
+                    issues.append(("NEEDS REVIEW", "no/unparseable EUR price"))
+            elif cur != "USD":
                 issues.append(("CURRENCY — REVIEW",
-                               f"confirmed in {currency}; cannot compare to USD price directly"))
+                               f"confirmed in {currency}; no live rate available to convert"))
             else:
                 try:
                     cp = float(str(conf.get("unit_price")).replace("$", "").replace(",", ""))
@@ -169,8 +215,10 @@ def reconcile(pos, vendors, confirmations):
             if not issues:
                 results.append(_row(po_number, po, conf, "OK", "matches"))
             else:
-                for issue, detail in issues:
-                    results.append(_row(po_number, po, conf, issue, detail))
+                # one row per line: worst issue becomes the status, all flags combined
+                worst = min(issues, key=lambda x: SEVERITY_ORDER.get(x[0], 5))[0]
+                detail = "; ".join(d for _, d in issues)
+                results.append(_row(po_number, po, conf, worst, detail))
 
     df = pd.DataFrame(results)
     df["_sev"] = df["issue"].map(SEVERITY_ORDER).fillna(5)

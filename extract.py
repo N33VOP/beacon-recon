@@ -8,12 +8,16 @@ review rather than guessing a price off a bad image.
 """
 
 import json
+import io
+import base64
 import pdfplumber
 from groq import Groq
 
-
-_API_KEY = ""
+# Key can be hardcoded for local script use, or set at runtime (e.g. from the app).
+_API_KEY = ""  # set via app or Streamlit secret
 _client = None
+
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 def set_api_key(key):
@@ -60,44 +64,89 @@ Confirmation text:
 """
 
 
-def extract_confirmation(source, name=None):
-    """
-    source: a file path (str) OR a file-like object (e.g. an uploaded PDF).
-    Returns (confirmation_dict, status). status is 'ok' or 'scan_review'.
-    """
-    if name is None:
-        name = source if isinstance(source, str) else "uploaded.pdf"
+def _read_bytes(source):
+    if isinstance(source, str):
+        with open(source, "rb") as fh:
+            return fh.read()
+    if hasattr(source, "getvalue"):
+        return source.getvalue()
+    return source.read()
 
-    # 1. Pull text with plain code (no LLM needed to read a text PDF)
+
+def _text_from_pdf(pdf_bytes):
     text = ""
     try:
-        with pdfplumber.open(source) as pdf:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text += (page.extract_text() or "") + "\n"
     except Exception:
         text = ""
+    return text
 
-    # 2. Scan detection: no meaningful text => image-only PDF => manual review
-    if len(text.strip()) < 25:
-        return {
-            "po_number": f"[SCAN] {name}",
-            "currency": "USD",
-            "lines": [],
-            "_status": "scan_review",
-            "_note": "No extractable text — likely a scanned image. Flag for Lisa to read by eye.",
-        }, "scan_review"
 
-    # 3. LLM extraction — the one place text understanding matters
+def _extract_via_text(text):
     resp = _get_client().chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": EXTRACTION_PROMPT.replace("{text}", text)}],
         temperature=0,
         response_format={"type": "json_object"},
     )
-    data = json.loads(resp.choices[0].message.content)
+    return json.loads(resp.choices[0].message.content)
 
-    # 4. Validation guard — never let a malformed extraction into the engine silently
-    data.setdefault("currency", "USD")
-    data.setdefault("lines", [])
-    data["_status"] = "ok"
-    return data, "ok"
+
+def _extract_via_vision(pdf_bytes):
+    """Scanned PDF: render the first page to an image and read it with a vision model."""
+    import fitz  # PyMuPDF — renders without system deps
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    png = doc[0].get_pixmap(dpi=200).tobytes("png")
+    b64 = base64.b64encode(png).decode()
+    resp = _get_client().chat.completions.create(
+        model=VISION_MODEL,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": EXTRACTION_PROMPT.replace(
+                "{text}", "(The confirmation is the attached scanned image. Read it carefully.)")},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]}],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+def extract_confirmation(source, name=None):
+    """
+    source: a file path (str) OR a file-like object (e.g. an uploaded PDF).
+    Cascade: text extraction -> vision (for scans) -> manual review (truly unreadable).
+    Returns (confirmation_dict, status). status is 'ok' or 'scan_review'.
+    """
+    if name is None:
+        name = source if isinstance(source, str) else "uploaded.pdf"
+    pdf_bytes = _read_bytes(source)
+
+    # 1. Text path — no LLM needed to read a text PDF
+    text = _text_from_pdf(pdf_bytes)
+    if len(text.strip()) >= 25:
+        data = _extract_via_text(text)
+        data.setdefault("currency", "USD")
+        data.setdefault("lines", [])
+        data["_status"], data["_method"] = "ok", "text"
+        return data, "ok"
+
+    # 2. Vision path — scanned/image PDF, read the rendered page
+    try:
+        data = _extract_via_vision(pdf_bytes)
+        if data.get("lines"):
+            data.setdefault("currency", "USD")
+            data["_status"], data["_method"] = "ok", "vision"
+            return data, "ok"
+    except Exception:
+        pass  # fall through to manual review
+
+    # 3. Truly unreadable — leave it as an error file for Lisa to eyeball
+    return {
+        "po_number": f"[UNREADABLE] {name}",
+        "currency": "USD",
+        "lines": [],
+        "_status": "scan_review",
+        "_note": "No text and vision could not read it — flag for Lisa to check by eye.",
+    }, "scan_review"

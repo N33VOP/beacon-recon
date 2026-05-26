@@ -4,6 +4,8 @@ Beacon PO Reconciliation — Lisa's app.
 Drop the PO list, the vendor master, and the confirmation PDFs in one box.
 The app sorts them out, runs the same verified engine, and gives back the
 action list on screen plus a downloadable Excel.
+
+Run locally:   streamlit run app.py
 """
 
 import io
@@ -36,11 +38,20 @@ SEV_COLOR = {
 st.title("Beacon PO Confirmation Reconciliation")
 st.caption("Catches silently dropped lines, price drift, date slips, and quantity shorts across vendor confirmations.")
 
-# --- API key ---
+# --- API key: from deployment secret if present, else ask (local/dev) ---
+try:
+    SECRET_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    SECRET_KEY = ""
+
 with st.sidebar:
     st.subheader("Setup")
-    key = st.text_input("Groq API key", type="password",
-                        help="Used only to read the PDFs. Reimbursed per the program.")
+    if SECRET_KEY:
+        key = SECRET_KEY
+        st.success("Connected and ready.")
+    else:
+        key = st.text_input("Groq API key", type="password",
+                            help="Used only to read the PDFs.")
     st.markdown("**How to use**")
     st.markdown("Drop your open PO list, the vendor master, and all confirmation PDFs below, then press Reconcile.")
 
@@ -87,7 +98,12 @@ if uploaded and st.button("Reconcile", type="primary"):
         progress.progress((i + 1) / max(len(pdfs), 1), text=f"Read {f.name}")
     progress.empty()
 
-    results = reconcile(pos, vendors, confirmations)
+    from currency import usd_per_eur
+    fx_rate = usd_per_eur()
+    if fx_rate:
+        st.caption(f"Live FX applied: 1 EUR = ${fx_rate:.4f} USD (ECB). EUR prices converted and checked within 2%.")
+
+    results = reconcile(pos, vendors, confirmations, usd_per_eur=fx_rate)
     action = results[results["issue"] != "OK"].reset_index(drop=True)
 
     # --- summary metrics ---
