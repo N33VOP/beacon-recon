@@ -30,10 +30,11 @@ SEVERITY_ORDER = {
     "QTY MISMATCH": 1,
     "UNKNOWN PO": 2,
     "PRICE DRIFT": 3,
-    "CURRENCY — REVIEW": 4,
+    "FX CHECK": 4,
     "DATE SLIP": 5,
     "NO PRICE SHOWN": 6,
-    "NEEDS REVIEW": 7,
+    "CURRENCY — REVIEW": 7,
+    "NEEDS REVIEW": 8,
     "OK": 9,
 }
 
@@ -182,15 +183,16 @@ def reconcile(pos, vendors, confirmations, usd_per_eur=None):
             # --- PRICE ---
             cur = currency.upper()
             if cur == "EUR" and usd_per_eur:
-                # convert at live rate, then apply the same tolerance band
+                # convert at live rate; differences here are FX-sensitive, not a vendor price change
                 try:
                     cp_eur = float(str(conf.get("unit_price")).replace("€", "").replace(",", ""))
                     cp_usd = cp_eur * usd_per_eur
                     po_price = float(po["unit_price"])
                     if po_price > 0 and abs(cp_usd - po_price) / po_price > PRICE_DRIFT_PCT:
-                        issues.append(("PRICE DRIFT",
-                                       f"PO ${po_price:.4f} vs €{cp_eur:.4f} ≈ ${cp_usd:.2f} "
-                                       f"(@ {usd_per_eur:.4f} USD/EUR) — outside {PRICE_DRIFT_PCT*100:.0f}%"))
+                        pct = (cp_usd - po_price) / po_price * 100
+                        issues.append(("FX CHECK",
+                                       f"€{cp_eur:.2f} ≈ ${cp_usd:.2f} @ {usd_per_eur:.4f} vs PO ${po_price:.2f} "
+                                       f"({pct:+.1f}%) — likely currency movement since PO; verify agreed rate"))
                     # within band -> not an issue
                 except (TypeError, ValueError):
                     issues.append(("NO PRICE SHOWN", "no price shown on confirmation (service/contract pricing?)"))

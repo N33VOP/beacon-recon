@@ -30,6 +30,7 @@ SEV_COLOR = {
     "QTY MISMATCH": "#fbd9b5",
     "UNKNOWN PO": "#fbd9b5",
     "PRICE DRIFT": "#fcec9e",
+    "FX CHECK": "#dcd2f5",
     "CURRENCY — REVIEW": "#dcd2f5",
     "DATE SLIP": "#c9def8",
     "NO PRICE SHOWN": "#e6e6e6",
@@ -121,7 +122,7 @@ if uploaded and st.button("Reconcile", type="primary"):
     counts = results["issue"].value_counts().to_dict()
     cols = st.columns(6)
     for col, label in zip(cols, ["DROPPED LINE", "QTY MISMATCH", "PRICE DRIFT",
-                                  "CURRENCY — REVIEW", "DATE SLIP", "OK"]):
+                                  "FX CHECK", "DATE SLIP", "OK"]):
         col.metric(label.title(), counts.get(label, 0))
 
     # --- action table (coloured) ---
